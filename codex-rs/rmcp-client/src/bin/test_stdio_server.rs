@@ -7,11 +7,19 @@ use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::CallToolRequestParam;
 use rmcp::model::CallToolResult;
+use rmcp::model::GetPromptRequestParam;
+use rmcp::model::GetPromptResult;
 use rmcp::model::JsonObject;
+use rmcp::model::ListPromptsResult;
 use rmcp::model::ListResourceTemplatesResult;
 use rmcp::model::ListResourcesResult;
 use rmcp::model::ListToolsResult;
 use rmcp::model::PaginatedRequestParam;
+use rmcp::model::Prompt;
+use rmcp::model::PromptArgument;
+use rmcp::model::PromptMessage;
+use rmcp::model::PromptMessageContent;
+use rmcp::model::PromptMessageRole;
 use rmcp::model::RawResource;
 use rmcp::model::RawResourceTemplate;
 use rmcp::model::ReadResourceRequestParam;
@@ -31,10 +39,13 @@ struct TestToolServer {
     tools: Arc<Vec<Tool>>,
     resources: Arc<Vec<Resource>>,
     resource_templates: Arc<Vec<ResourceTemplate>>,
+    prompts: Arc<Vec<Prompt>>,
 }
 
 const MEMO_URI: &str = "memo://codex/example-note";
 const MEMO_CONTENT: &str = "This is a sample MCP resource served by the rmcp test server.";
+const PROMPT_NAME: &str = "greet-user";
+
 pub fn stdio() -> (tokio::io::Stdin, tokio::io::Stdout) {
     (tokio::io::stdin(), tokio::io::stdout())
 }
@@ -43,10 +54,12 @@ impl TestToolServer {
         let tools = vec![Self::echo_tool()];
         let resources = vec![Self::memo_resource()];
         let resource_templates = vec![Self::memo_template()];
+        let prompts = vec![Self::greeting_prompt()];
         Self {
             tools: Arc::new(tools),
             resources: Arc::new(resources),
             resource_templates: Arc::new(resource_templates),
+            prompts: Arc::new(prompts),
         }
     }
 
@@ -99,6 +112,21 @@ impl TestToolServer {
     fn memo_text() -> &'static str {
         MEMO_CONTENT
     }
+
+    fn greeting_prompt() -> Prompt {
+        Prompt {
+            name: PROMPT_NAME.to_string(),
+            title: Some("Greet User".to_string()),
+            description: Some("Send a friendly greeting to the provided user.".to_string()),
+            arguments: Some(vec![PromptArgument {
+                name: "name".to_string(),
+                title: Some("Recipient".to_string()),
+                description: Some("Name to greet".to_string()),
+                required: Some(true),
+            }]),
+            icons: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -114,6 +142,7 @@ impl ServerHandler for TestToolServer {
             capabilities: ServerCapabilities::builder()
                 .enable_tools()
                 .enable_tool_list_changed()
+                .enable_prompts()
                 .enable_resources()
                 .build(),
             ..ServerInfo::default()
@@ -157,6 +186,48 @@ impl ServerHandler for TestToolServer {
             resource_templates: (*self.resource_templates).clone(),
             next_cursor: None,
         })
+    }
+
+    fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
+        let prompts = self.prompts.clone();
+        async move {
+            Ok(ListPromptsResult {
+                prompts: (*prompts).clone(),
+                next_cursor: None,
+            })
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        request: GetPromptRequestParam,
+        _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> Result<GetPromptResult, McpError> {
+        if request.name == PROMPT_NAME {
+            let name = request
+                .arguments
+                .and_then(|mut args| args.remove("name"))
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "friend".to_string());
+            Ok(GetPromptResult {
+                description: Some("Send a friendly greeting to the provided user.".to_string()),
+                messages: vec![PromptMessage {
+                    role: PromptMessageRole::Assistant,
+                    content: PromptMessageContent::Text {
+                        text: format!("Hello, {name}!"),
+                    },
+                }],
+            })
+        } else {
+            Err(McpError::invalid_params(
+                format!("prompt `{}` not found", request.name),
+                None,
+            ))
+        }
     }
 
     async fn read_resource(
