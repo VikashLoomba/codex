@@ -11,8 +11,12 @@ use anyhow::anyhow;
 use futures::FutureExt;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
+use mcp_types::GetPromptRequestParams;
+use mcp_types::GetPromptResult;
 use mcp_types::InitializeRequestParams;
 use mcp_types::InitializeResult;
+use mcp_types::ListPromptsRequestParams;
+use mcp_types::ListPromptsResult;
 use mcp_types::ListResourceTemplatesRequestParams;
 use mcp_types::ListResourceTemplatesResult;
 use mcp_types::ListResourcesRequestParams;
@@ -23,6 +27,7 @@ use mcp_types::ReadResourceRequestParams;
 use mcp_types::ReadResourceResult;
 use reqwest::header::HeaderMap;
 use rmcp::model::CallToolRequestParam;
+use rmcp::model::GetPromptRequestParam;
 use rmcp::model::InitializeRequestParam;
 use rmcp::model::PaginatedRequestParam;
 use rmcp::model::ReadResourceRequestParam;
@@ -300,6 +305,37 @@ impl RmcpClient {
 
         let fut = service.list_resource_templates(rmcp_params);
         let result = run_with_timeout(fut, timeout, "resources/templates/list").await?;
+        let converted = convert_to_mcp(result)?;
+        self.persist_oauth_tokens().await;
+        Ok(converted)
+    }
+
+    pub async fn list_prompts(
+        &self,
+        params: Option<ListPromptsRequestParams>,
+        timeout: Option<Duration>,
+    ) -> Result<ListPromptsResult> {
+        let service = self.service().await?;
+        let rmcp_params = params
+            .map(convert_to_rmcp::<_, PaginatedRequestParam>)
+            .transpose()?;
+
+        let fut = service.list_prompts(rmcp_params);
+        let result = run_with_timeout(fut, timeout, "prompts/list").await?;
+        let converted = convert_to_mcp(result)?;
+        self.persist_oauth_tokens().await;
+        Ok(converted)
+    }
+
+    pub async fn get_prompt(
+        &self,
+        params: GetPromptRequestParams,
+        timeout: Option<Duration>,
+    ) -> Result<GetPromptResult> {
+        let service = self.service().await?;
+        let rmcp_params: GetPromptRequestParam = convert_to_rmcp(params)?;
+        let fut = service.get_prompt(rmcp_params);
+        let result = run_with_timeout(fut, timeout, "prompts/get").await?;
         let converted = convert_to_mcp(result)?;
         self.persist_oauth_tokens().await;
         Ok(converted)
