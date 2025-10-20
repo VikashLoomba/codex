@@ -24,6 +24,9 @@ use anyhow::Result;
 use anyhow::anyhow;
 use mcp_types::CallToolRequest;
 use mcp_types::CallToolRequestParams;
+use mcp_types::GetPromptRequest;
+use mcp_types::GetPromptRequestParams;
+use mcp_types::GetPromptResult;
 use mcp_types::InitializeRequest;
 use mcp_types::InitializeRequestParams;
 use mcp_types::InitializedNotification;
@@ -32,6 +35,9 @@ use mcp_types::JSONRPCMessage;
 use mcp_types::JSONRPCNotification;
 use mcp_types::JSONRPCRequest;
 use mcp_types::JSONRPCResponse;
+use mcp_types::ListPromptsRequest;
+use mcp_types::ListPromptsRequestParams;
+use mcp_types::ListPromptsResult;
 use mcp_types::ListToolsRequest;
 use mcp_types::ListToolsRequestParams;
 use mcp_types::ListToolsResult;
@@ -339,6 +345,25 @@ impl McpClient {
         timeout: Option<Duration>,
     ) -> Result<ListToolsResult> {
         self.send_request::<ListToolsRequest>(params, timeout).await
+    }
+
+    /// Convenience wrapper around `prompts/list`.
+    pub async fn list_prompts(
+        &self,
+        params: Option<ListPromptsRequestParams>,
+        timeout: Option<Duration>,
+    ) -> Result<ListPromptsResult> {
+        self.send_request::<ListPromptsRequest>(params, timeout)
+            .await
+    }
+
+    /// Convenience wrapper around `prompts/get`.
+    pub async fn get_prompt(
+        &self,
+        params: GetPromptRequestParams,
+        timeout: Option<Duration>,
+    ) -> Result<GetPromptResult> {
+        self.send_request::<GetPromptRequest>(params, timeout).await
     }
 
     /// Convenience wrapper around `tools/call`.

@@ -6,6 +6,8 @@ use shlex::Shlex;
 use std::collections::HashMap;
 use std::collections::HashSet;
 
+pub const MCP_PROMPT_CMD_PREFIX: &str = "prompt";
+
 lazy_static! {
     static ref PROMPT_ARG_REGEX: Regex =
         Regex::new(r"\$[A-Z][A-Z0-9_]*").unwrap_or_else(|_| std::process::abort());
@@ -54,6 +56,73 @@ impl PromptExpansionError {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPromptArgument {
+    pub name: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPrompt {
+    pub qualified_name: String,
+    pub server_name: String,
+    pub prompt_name: String,
+    pub description: Option<String>,
+    pub argument_hint: Option<String>,
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpPromptInvocation {
+    pub qualified_name: String,
+    pub server_name: String,
+    pub prompt_name: String,
+    pub arguments: HashMap<String, String>,
+}
+
+pub fn expand_mcp_prompt(
+    command: &str,
+    prompts: &[McpPrompt],
+) -> Result<Option<McpPromptInvocation>, PromptExpansionError> {
+    let Some((name, rest)) = parse_slash_name(command) else {
+        return Ok(None);
+    };
+    let Some(qualified_name) = name.strip_prefix(&format!("{MCP_PROMPT_CMD_PREFIX}:")) else {
+        return Ok(None);
+    };
+
+    let prompt = match prompts.iter().find(|p| p.qualified_name == qualified_name) {
+        Some(prompt) => prompt,
+        None => return Ok(None),
+    };
+
+    let inputs = parse_prompt_inputs(rest).map_err(|error| PromptExpansionError::Args {
+        command: command.to_string(),
+        error,
+    })?;
+
+    let mut missing = Vec::new();
+    for argument in &prompt.arguments {
+        if argument.required && !inputs.contains_key(&argument.name) {
+            missing.push(argument.name.clone());
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(PromptExpansionError::MissingArgs {
+            command: command.to_string(),
+            missing,
+        });
+    }
+
+    Ok(Some(McpPromptInvocation {
+        qualified_name: prompt.qualified_name.clone(),
+        server_name: prompt.server_name.clone(),
+        prompt_name: prompt.prompt_name.clone(),
+        arguments: inputs,
+    }))
 }
 
 /// Parse a first-line slash command of the form `/name <rest>`.
@@ -402,5 +471,56 @@ mod tests {
 
         let out = expand_custom_prompt("/prompts:my-prompt", &prompts).unwrap();
         assert_eq!(out, Some("literal $$USER".to_string()));
+    }
+
+    fn sample_mcp_prompt(name: &str, required_args: &[&str]) -> McpPrompt {
+        McpPrompt {
+            qualified_name: format!("server__{name}"),
+            server_name: "server".to_string(),
+            prompt_name: name.to_string(),
+            description: None,
+            argument_hint: None,
+            arguments: required_args
+                .iter()
+                .map(|arg| McpPromptArgument {
+                    name: (*arg).to_string(),
+                    required: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn expand_mcp_prompt_returns_invocation() {
+        let prompts = vec![sample_mcp_prompt("greet", &["USER"])];
+        let invocation = expand_mcp_prompt("/prompt:server__greet USER=Alice", &prompts)
+            .unwrap()
+            .expect("prompt should match");
+
+        assert_eq!(invocation.qualified_name, "server__greet");
+        assert_eq!(invocation.server_name, "server");
+        assert_eq!(invocation.prompt_name, "greet");
+        assert_eq!(invocation.arguments.get("USER"), Some(&"Alice".to_string()));
+    }
+
+    #[test]
+    fn expand_mcp_prompt_missing_required_args() {
+        let prompts = vec![sample_mcp_prompt("greet", &["USER", "BRANCH"])];
+        let err = expand_mcp_prompt("/prompt:server__greet USER=Alice", &prompts).unwrap_err();
+
+        match err {
+            PromptExpansionError::MissingArgs { command, missing } => {
+                assert_eq!(command, "/prompt:server__greet USER=Alice");
+                assert_eq!(missing, vec!["BRANCH".to_string()]);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_mcp_prompt_unknown_prompt_returns_none() {
+        let prompts = vec![sample_mcp_prompt("greet", &["USER"])];
+        let result = expand_mcp_prompt("/prompt:other__greet USER=Alice", &prompts).unwrap();
+        assert!(result.is_none());
     }
 }

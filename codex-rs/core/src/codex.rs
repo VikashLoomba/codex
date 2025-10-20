@@ -32,6 +32,9 @@ use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use mcp_types::CallToolResult;
+use mcp_types::ContentBlock;
+use mcp_types::GetPromptRequestParams;
+use mcp_types::GetPromptResult;
 use mcp_types::ListResourceTemplatesRequestParams;
 use mcp_types::ListResourceTemplatesResult;
 use mcp_types::ListResourcesRequestParams;
@@ -39,6 +42,7 @@ use mcp_types::ListResourcesResult;
 use mcp_types::ReadResourceRequestParams;
 use mcp_types::ReadResourceResult;
 use serde_json;
+use serde_json::Map as JsonMap;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -81,6 +85,11 @@ use crate::protocol::Event;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecApprovalRequestEvent;
 use crate::protocol::ListCustomPromptsResponseEvent;
+use crate::protocol::McpPromptArgument;
+use crate::protocol::McpPromptErrorEvent;
+use crate::protocol::McpPromptReadyEvent;
+use crate::protocol::McpPromptSummary;
+use crate::protocol::McpPromptsResponseEvent;
 use crate::protocol::Op;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::ReviewDecision;
@@ -1276,6 +1285,89 @@ async fn submission_loop(sess: Arc<Session>, config: Arc<Config>, rx_sub: Receiv
                 };
                 sess.send_event(event).await;
             }
+            Op::ListMcpPrompts => {
+                let sub_id = sub.id.clone();
+                let mut prompts: Vec<McpPromptSummary> = sess
+                    .services
+                    .mcp_connection_manager
+                    .list_all_prompt_infos()
+                    .into_iter()
+                    .map(|(qualified_name, info)| McpPromptSummary {
+                        description: info.prompt.description.clone(),
+                        argument_hint: info.prompt.title.clone(),
+                        arguments: info
+                            .prompt
+                            .arguments
+                            .clone()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|arg| McpPromptArgument {
+                                name: arg.name,
+                                required: arg.required.unwrap_or(false),
+                            })
+                            .collect(),
+                        qualified_name,
+                        server_name: info.server_name,
+                        prompt_name: info.prompt_name,
+                    })
+                    .collect();
+                prompts.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+
+                let event = Event {
+                    id: sub_id,
+                    msg: EventMsg::McpPromptsResponse(McpPromptsResponseEvent {
+                        custom_prompts: prompts,
+                    }),
+                };
+                sess.send_event(event).await;
+            }
+            Op::RunMcpPrompt {
+                qualified_name,
+                server_name,
+                prompt_name,
+                arguments,
+            } => {
+                let sub_id = sub.id.clone();
+                let mut map = JsonMap::new();
+                for (key, value) in &arguments {
+                    map.insert(key.clone(), serde_json::Value::String(value.clone()));
+                }
+                let params = GetPromptRequestParams {
+                    name: prompt_name.clone(),
+                    arguments: if map.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Object(map))
+                    },
+                };
+
+                let result = sess
+                    .services
+                    .mcp_connection_manager
+                    .get_prompt(&server_name, params)
+                    .await
+                    .and_then(render_mcp_prompt_result);
+
+                let msg = match result {
+                    Ok(content) => EventMsg::McpPromptReady(McpPromptReadyEvent {
+                        server_name,
+                        prompt_name,
+                        qualified_name,
+                        content,
+                    }),
+                    Err(err) => {
+                        error!("failed to prepare MCP prompt: {err:#}");
+                        EventMsg::McpPromptError(McpPromptErrorEvent {
+                            server_name,
+                            prompt_name,
+                            qualified_name,
+                            message: err.to_string(),
+                        })
+                    }
+                };
+
+                sess.send_event(Event { id: sub_id, msg }).await;
+            }
             Op::Compact => {
                 let turn_context = sess.new_turn(SessionSettingsUpdate::default()).await;
                 // Attempt to inject input into current task
@@ -2319,6 +2411,31 @@ fn is_mcp_client_auth_required_error(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 pub(crate) use tests::make_session_and_context;
+
+fn render_mcp_prompt_result(result: GetPromptResult) -> anyhow::Result<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    for message in result.messages {
+        match message.content {
+            ContentBlock::TextContent(text) => chunks.push(text.text),
+            ContentBlock::ImageContent(_) => {
+                return Err(anyhow::anyhow!(
+                    "MCP prompt returned an unsupported image block"
+                ));
+            }
+            ContentBlock::AudioContent(_) => {
+                return Err(anyhow::anyhow!(
+                    "MCP prompt returned an unsupported audio block"
+                ));
+            }
+            ContentBlock::ResourceLink(_) | ContentBlock::EmbeddedResource(_) => {
+                return Err(anyhow::anyhow!(
+                    "MCP prompt returned a resource reference that cannot be rendered"
+                ));
+            }
+        }
+    }
+    Ok(chunks.join("\n\n"))
+}
 
 #[cfg(test)]
 mod tests {

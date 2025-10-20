@@ -34,6 +34,8 @@ mod scroll_state;
 mod selection_popup_common;
 mod textarea;
 pub(crate) use feedback_view::FeedbackView;
+pub(crate) use prompt_args::McpPrompt;
+pub(crate) use prompt_args::McpPromptArgument;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancellationEvent {
@@ -385,6 +387,11 @@ impl BottomPane {
     /// Update custom prompts available for the slash popup.
     pub(crate) fn set_custom_prompts(&mut self, prompts: Vec<CustomPrompt>) {
         self.composer.set_custom_prompts(prompts);
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_mcp_prompts(&mut self, prompts: Vec<McpPrompt>) {
+        self.composer.set_mcp_prompts(prompts);
         self.request_redraw();
     }
 

@@ -21,11 +21,16 @@ use codex_mcp_client::McpClient;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_rmcp_client::RmcpClient;
 use mcp_types::ClientCapabilities;
+use mcp_types::GetPromptRequestParams;
+use mcp_types::GetPromptResult;
 use mcp_types::Implementation;
+use mcp_types::ListPromptsRequestParams;
+use mcp_types::ListPromptsResult;
 use mcp_types::ListResourceTemplatesRequestParams;
 use mcp_types::ListResourceTemplatesResult;
 use mcp_types::ListResourcesRequestParams;
 use mcp_types::ListResourcesResult;
+use mcp_types::Prompt;
 use mcp_types::ReadResourceRequestParams;
 use mcp_types::ReadResourceResult;
 use mcp_types::Resource;
@@ -49,6 +54,7 @@ use crate::config_types::McpServerTransportConfig;
 /// choose a delimiter from this character set.
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
+const MAX_PROMPT_NAME_LENGTH: usize = 64;
 
 /// Default timeout for initializing MCP server & initially listing tools.
 const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -96,6 +102,48 @@ struct ToolInfo {
     server_name: String,
     tool_name: String,
     tool: Tool,
+}
+
+#[derive(Clone)]
+pub(crate) struct PromptInfo {
+    pub(crate) server_name: String,
+    pub(crate) prompt_name: String,
+    pub(crate) prompt: Prompt,
+}
+
+fn qualify_prompts(prompts: Vec<PromptInfo>) -> HashMap<String, PromptInfo> {
+    let mut used_names = HashSet::new();
+    let mut qualified_prompts = HashMap::new();
+
+    for prompt in prompts {
+        let mut qualified_name = format!(
+            "{}{}{}",
+            prompt.server_name, MCP_TOOL_NAME_DELIMITER, prompt.prompt_name
+        );
+        if qualified_name.len() > MAX_PROMPT_NAME_LENGTH {
+            let mut hasher = Sha1::new();
+            hasher.update(qualified_name.as_bytes());
+            let sha1 = hasher.finalize();
+            let sha1_str = format!("{sha1:x}");
+
+            let prefix_len = MAX_PROMPT_NAME_LENGTH.saturating_sub(sha1_str.len());
+            qualified_name = if prefix_len == 0 {
+                sha1_str
+            } else {
+                format!("{}{}", &qualified_name[..prefix_len], sha1_str)
+            };
+        }
+
+        if used_names.contains(&qualified_name) {
+            warn!("skipping duplicated prompt {}", qualified_name);
+            continue;
+        }
+
+        used_names.insert(qualified_name.clone());
+        qualified_prompts.insert(qualified_name, prompt);
+    }
+
+    qualified_prompts
 }
 
 struct ManagedClient {
@@ -172,6 +220,28 @@ impl McpClientAdapter {
         }
     }
 
+    async fn list_prompts(
+        &self,
+        params: Option<ListPromptsRequestParams>,
+        timeout: Option<Duration>,
+    ) -> Result<ListPromptsResult> {
+        match self {
+            McpClientAdapter::Legacy(client) => client.list_prompts(params, timeout).await,
+            McpClientAdapter::Rmcp(client) => client.list_prompts(params, timeout).await,
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        params: GetPromptRequestParams,
+        timeout: Option<Duration>,
+    ) -> Result<GetPromptResult> {
+        match self {
+            McpClientAdapter::Legacy(client) => client.get_prompt(params.clone(), timeout).await,
+            McpClientAdapter::Rmcp(client) => client.get_prompt(params, timeout).await,
+        }
+    }
+
     async fn list_resources(
         &self,
         params: Option<mcp_types::ListResourcesRequestParams>,
@@ -237,6 +307,9 @@ pub(crate) struct McpConnectionManager {
 
     /// Fully qualified tool name -> tool instance.
     tools: HashMap<String, ToolInfo>,
+
+    /// Fully qualified prompt name -> prompt instance.
+    prompts: HashMap<String, PromptInfo>,
 }
 
 impl McpConnectionManager {
@@ -395,7 +468,23 @@ impl McpConnectionManager {
 
         let tools = qualify_tools(all_tools);
 
-        Ok((Self { clients, tools }, errors))
+        let all_prompts = match list_all_prompts(&clients).await {
+            Ok(prompts) => prompts,
+            Err(e) => {
+                warn!("Failed to list prompts from some MCP servers: {e:#}");
+                Vec::new()
+            }
+        };
+        let prompts = qualify_prompts(all_prompts);
+
+        Ok((
+            Self {
+                clients,
+                tools,
+                prompts,
+            },
+            errors,
+        ))
     }
 
     /// Returns a single map that contains all tools. Each key is the
@@ -404,6 +493,13 @@ impl McpConnectionManager {
         self.tools
             .iter()
             .map(|(name, tool)| (name.clone(), tool.tool.clone()))
+            .collect()
+    }
+
+    pub fn list_all_prompt_infos(&self) -> Vec<(String, PromptInfo)> {
+        self.prompts
+            .iter()
+            .map(|(name, prompt)| (name.clone(), prompt.clone()))
             .collect()
     }
 
@@ -617,6 +713,24 @@ impl McpConnectionManager {
             .get(tool_name)
             .map(|tool| (tool.server_name.clone(), tool.tool_name.clone()))
     }
+
+    pub async fn get_prompt(
+        &self,
+        server: &str,
+        params: GetPromptRequestParams,
+    ) -> Result<GetPromptResult> {
+        let managed = self
+            .clients
+            .get(server)
+            .ok_or_else(|| anyhow!("unknown MCP server '{server}'"))?;
+        let client = managed.client.clone();
+        let timeout = managed.tool_timeout;
+
+        client
+            .get_prompt(params, timeout)
+            .await
+            .with_context(|| format!("prompts/get failed for `{server}`"))
+    }
 }
 
 fn resolve_bearer_token(
@@ -696,6 +810,72 @@ async fn list_all_tools(clients: &HashMap<String, ManagedClient>) -> Result<Vec<
         aggregated.len(),
         clients.len()
     );
+
+    Ok(aggregated)
+}
+
+async fn list_all_prompts(clients: &HashMap<String, ManagedClient>) -> Result<Vec<PromptInfo>> {
+    let mut join_set = JoinSet::new();
+
+    for (server_name, managed_client) in clients {
+        let server_name_cloned = server_name.clone();
+        let client_clone = managed_client.client.clone();
+        let timeout = managed_client.tool_timeout;
+
+        join_set.spawn(async move {
+            let mut collected: Vec<Prompt> = Vec::new();
+            let mut cursor: Option<String> = None;
+
+            loop {
+                let params = cursor.as_ref().map(|next| ListPromptsRequestParams {
+                    cursor: Some(next.clone()),
+                });
+                let response = match client_clone.list_prompts(params, timeout).await {
+                    Ok(result) => result,
+                    Err(err) => return (server_name_cloned, Err(err)),
+                };
+
+                collected.extend(response.prompts);
+
+                match response.next_cursor {
+                    Some(next) => {
+                        if cursor.as_ref() == Some(&next) {
+                            return (
+                                server_name_cloned,
+                                Err(anyhow!("prompts/list returned duplicate cursor")),
+                            );
+                        }
+                        cursor = Some(next);
+                    }
+                    None => {
+                        let prompts = collected
+                            .into_iter()
+                            .map(|prompt| PromptInfo {
+                                server_name: server_name_cloned.clone(),
+                                prompt_name: prompt.name.clone(),
+                                prompt,
+                            })
+                            .collect();
+                        return (server_name_cloned, Ok(prompts));
+                    }
+                }
+            }
+        });
+    }
+
+    let mut aggregated: Vec<PromptInfo> = Vec::new();
+
+    while let Some(join_res) = join_set.join_next().await {
+        match join_res {
+            Ok((_server_name, Ok(mut prompts))) => aggregated.append(&mut prompts),
+            Ok((server_name, Err(err))) => {
+                warn!("Failed to list prompts for MCP server '{server_name}': {err:#}");
+            }
+            Err(err) => {
+                warn!("Task panic when listing prompts for MCP server: {err:#}");
+            }
+        }
+    }
 
     Ok(aggregated)
 }
@@ -792,5 +972,74 @@ mod tests {
             keys[1],
             "mcp__my_server__yet_anot419a82a89325c1b477274a41f8c65ea5f3a7f341"
         );
+    }
+
+    fn create_test_prompt(server_name: &str, prompt_name: &str) -> PromptInfo {
+        PromptInfo {
+            server_name: server_name.to_string(),
+            prompt_name: prompt_name.to_string(),
+            prompt: Prompt {
+                arguments: None,
+                description: None,
+                name: prompt_name.to_string(),
+                title: None,
+            },
+        }
+    }
+
+    #[test]
+    fn test_qualify_prompts_short_non_duplicated_names() {
+        let prompts = vec![
+            create_test_prompt("server1", "prompt1"),
+            create_test_prompt("server1", "prompt2"),
+        ];
+
+        let qualified_prompts = qualify_prompts(prompts);
+
+        assert_eq!(qualified_prompts.len(), 2);
+        assert!(qualified_prompts.contains_key("server1__prompt1"));
+        assert!(qualified_prompts.contains_key("server1__prompt2"));
+    }
+
+    #[test]
+    fn test_qualify_prompts_duplicated_names_skipped() {
+        let prompts = vec![
+            create_test_prompt("server1", "duplicate_prompt"),
+            create_test_prompt("server1", "duplicate_prompt"),
+        ];
+
+        let qualified_prompts = qualify_prompts(prompts);
+
+        assert_eq!(qualified_prompts.len(), 1);
+        assert!(qualified_prompts.contains_key("server1__duplicate_prompt"));
+    }
+
+    #[test]
+    fn test_qualify_prompts_long_names_same_server() {
+        let server_name = "my_server";
+
+        let prompts = vec![
+            create_test_prompt(
+                server_name,
+                "extremely_lengthy_prompt_name_that_absolutely_surpasses_all_reasonable_limits",
+            ),
+            create_test_prompt(
+                server_name,
+                "yet_another_extremely_lengthy_prompt_name_that_absolutely_surpasses_all_reasonable_limits",
+            ),
+        ];
+
+        let qualified_prompts = qualify_prompts(prompts);
+
+        assert_eq!(qualified_prompts.len(), 2);
+
+        let mut keys: Vec<_> = qualified_prompts.keys().cloned().collect();
+        keys.sort();
+
+        assert_eq!(keys[0].len(), 64);
+        assert!(keys[0].starts_with("my_server__extremely_"));
+
+        assert_eq!(keys[1].len(), 64);
+        assert!(keys[1].starts_with("my_server__yet_another_"));
     }
 }

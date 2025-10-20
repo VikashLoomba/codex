@@ -6,6 +6,9 @@ use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
 use super::selection_popup_common::render_rows;
+use crate::bottom_pane::prompt_args::MCP_PROMPT_CMD_PREFIX;
+use crate::bottom_pane::prompt_args::McpPrompt;
+use crate::bottom_pane::prompt_args::McpPromptArgument;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::slash_command::SlashCommand;
@@ -21,12 +24,15 @@ pub(crate) enum CommandItem {
     Builtin(SlashCommand),
     // Index into `prompts`
     UserPrompt(usize),
+    // Index into `remote_prompts`
+    RemotePrompt(usize),
 }
 
 pub(crate) struct CommandPopup {
     command_filter: String,
     builtins: Vec<(&'static str, SlashCommand)>,
     prompts: Vec<CustomPrompt>,
+    remote_prompts: Vec<McpPrompt>,
     state: ScrollState,
 }
 
@@ -41,6 +47,7 @@ impl CommandPopup {
             command_filter: String::new(),
             builtins,
             prompts,
+            remote_prompts: Vec::new(),
             state: ScrollState::new(),
         }
     }
@@ -56,8 +63,17 @@ impl CommandPopup {
         self.prompts = prompts;
     }
 
+    pub(crate) fn set_remote_prompts(&mut self, mut prompts: Vec<McpPrompt>) {
+        prompts.sort_by(|a, b| a.qualified_name.cmp(&b.qualified_name));
+        self.remote_prompts = prompts;
+    }
+
     pub(crate) fn prompt(&self, idx: usize) -> Option<&CustomPrompt> {
         self.prompts.get(idx)
+    }
+
+    pub(crate) fn remote_prompt(&self, idx: usize) -> Option<&McpPrompt> {
+        self.remote_prompts.get(idx)
     }
 
     /// Update the filter string based on the current composer text. The text
@@ -115,6 +131,9 @@ impl CommandPopup {
             for idx in 0..self.prompts.len() {
                 out.push((CommandItem::UserPrompt(idx), None, 0));
             }
+            for idx in 0..self.remote_prompts.len() {
+                out.push((CommandItem::RemotePrompt(idx), None, 0));
+            }
             return out;
         }
 
@@ -132,16 +151,24 @@ impl CommandPopup {
                 out.push((CommandItem::UserPrompt(idx), Some(indices), score));
             }
         }
+        for (idx, p) in self.remote_prompts.iter().enumerate() {
+            let display = format!("{MCP_PROMPT_CMD_PREFIX}:{}", p.qualified_name);
+            if let Some((indices, score)) = fuzzy_match(&display, filter) {
+                out.push((CommandItem::RemotePrompt(idx), Some(indices), score));
+            }
+        }
         // When filtering, sort by ascending score and then by name for stability.
         out.sort_by(|a, b| {
             a.2.cmp(&b.2).then_with(|| {
                 let an = match a.0 {
                     CommandItem::Builtin(c) => c.command(),
                     CommandItem::UserPrompt(i) => &self.prompts[i].name,
+                    CommandItem::RemotePrompt(i) => &self.remote_prompts[i].qualified_name,
                 };
                 let bn = match b.0 {
                     CommandItem::Builtin(c) => c.command(),
                     CommandItem::UserPrompt(i) => &self.prompts[i].name,
+                    CommandItem::RemotePrompt(i) => &self.remote_prompts[i].qualified_name,
                 };
                 an.cmp(bn)
             })
@@ -172,6 +199,15 @@ impl CommandPopup {
                             .unwrap_or_else(|| "send saved prompt".to_string());
                         (
                             format!("/{PROMPTS_CMD_PREFIX}:{}", prompt.name),
+                            description,
+                        )
+                    }
+                    CommandItem::RemotePrompt(i) => {
+                        let prompt = &self.remote_prompts[i];
+                        let description = remote_prompt_description(prompt);
+                        let qualified_name = prompt.qualified_name.as_str();
+                        (
+                            format!("/{MCP_PROMPT_CMD_PREFIX}:{qualified_name}"),
                             description,
                         )
                     }
@@ -225,9 +261,87 @@ impl WidgetRef for CommandPopup {
     }
 }
 
+fn remote_prompt_description(prompt: &McpPrompt) -> String {
+    let base_description = prompt.description.clone().unwrap_or_else(|| {
+        prompt.argument_hint.clone().unwrap_or_else(|| {
+            let server_name = prompt.server_name.as_str();
+            format!("MCP prompt from {server_name}")
+        })
+    });
+
+    if prompt.arguments.is_empty() {
+        return base_description;
+    }
+
+    let hint = prompt
+        .argument_hint
+        .clone()
+        .or_else(|| auto_argument_hint(&prompt.arguments));
+
+    let Some(hint) = hint else {
+        return base_description;
+    };
+
+    if hint == base_description {
+        return base_description;
+    }
+
+    format!("{base_description} | {hint}")
+}
+
+fn auto_argument_hint(arguments: &[McpPromptArgument]) -> Option<String> {
+    if arguments.is_empty() {
+        return None;
+    }
+
+    let mut required: Vec<&McpPromptArgument> = Vec::new();
+    let mut optional: Vec<&McpPromptArgument> = Vec::new();
+    for argument in arguments {
+        if argument.required {
+            required.push(argument);
+        } else {
+            optional.push(argument);
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    if !required.is_empty() {
+        let required_list = required
+            .iter()
+            .map(|argument| {
+                let name = argument.name.as_str();
+                format!("{name}=...")
+            })
+            .collect::<Vec<String>>()
+            .join(" ");
+        parts.push(format!("req: {required_list}"));
+    }
+
+    if !optional.is_empty() {
+        let optional_list = optional
+            .iter()
+            .map(|argument| {
+                let name = argument.name.as_str();
+                format!("{name}=...")
+            })
+            .collect::<Vec<String>>()
+            .join(" ");
+        parts.push(format!("opt: {optional_list}"));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    Some(parts.join(" | "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bottom_pane::prompt_args::McpPrompt;
+    use crate::bottom_pane::prompt_args::McpPromptArgument;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -243,6 +357,7 @@ mod tests {
         let has_init = matches.iter().any(|item| match item {
             CommandItem::Builtin(cmd) => cmd.command() == "init",
             CommandItem::UserPrompt(_) => false,
+            CommandItem::RemotePrompt(_) => false,
         });
         assert!(
             has_init,
@@ -261,6 +376,9 @@ mod tests {
         match selected {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "init"),
             Some(CommandItem::UserPrompt(_)) => panic!("unexpected prompt selected for '/init'"),
+            Some(CommandItem::RemotePrompt(_)) => {
+                panic!("unexpected MCP prompt selected for '/init'")
+            }
             None => panic!("expected a selected command for exact match"),
         }
     }
@@ -274,6 +392,9 @@ mod tests {
             Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "model"),
             Some(CommandItem::UserPrompt(_)) => {
                 panic!("unexpected prompt ranked before '/model' for '/mo'")
+            }
+            Some(CommandItem::RemotePrompt(_)) => {
+                panic!("unexpected MCP prompt ranked before '/model' for '/mo'")
             }
             None => panic!("expected at least one match for '/mo'"),
         }
@@ -360,5 +481,86 @@ mod tests {
         let rows = popup.rows_from_matches(vec![(CommandItem::UserPrompt(0), None, 0)]);
         let description = rows.first().and_then(|row| row.description.as_deref());
         assert_eq!(description, Some("send saved prompt"));
+    }
+
+    #[test]
+    fn remote_prompts_listed_with_prompt_prefix() {
+        let mut popup = CommandPopup::new(Vec::new());
+        popup.set_remote_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: Some("remote draft prompt".to_string()),
+            argument_hint: Some("ARG=value".to_string()),
+            arguments: vec![McpPromptArgument {
+                name: "ARG".to_string(),
+                required: true,
+            }],
+        }]);
+
+        popup.on_composer_text_change("/prompt:server__dr".to_string());
+        let matches = popup.filtered_items();
+        let has_remote_prompt = matches
+            .iter()
+            .any(|item| matches!(item, CommandItem::RemotePrompt(_)));
+        assert!(
+            has_remote_prompt,
+            "expected remote prompt to be listed when filtering by `/prompt:server__dr`"
+        );
+    }
+
+    #[test]
+    fn remote_prompt_description_appends_argument_hint_when_present() {
+        let mut popup = CommandPopup::new(Vec::new());
+        popup.set_remote_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: Some("remote draft prompt".to_string()),
+            argument_hint: Some("ARG=value".to_string()),
+            arguments: vec![McpPromptArgument {
+                name: "ARG".to_string(),
+                required: true,
+            }],
+        }]);
+
+        let rows = popup.rows_from_matches(vec![(CommandItem::RemotePrompt(0), None, 0)]);
+        let description = rows
+            .first()
+            .and_then(|row| row.description.as_deref())
+            .expect("description should be present");
+        assert_eq!(description, "remote draft prompt | ARG=value");
+    }
+
+    #[test]
+    fn remote_prompt_description_infers_argument_hint() {
+        let mut popup = CommandPopup::new(Vec::new());
+        popup.set_remote_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: Some("remote draft prompt".to_string()),
+            argument_hint: None,
+            arguments: vec![
+                McpPromptArgument {
+                    name: "TOPIC".to_string(),
+                    required: true,
+                },
+                McpPromptArgument {
+                    name: "DETAILS".to_string(),
+                    required: false,
+                },
+            ],
+        }]);
+
+        let rows = popup.rows_from_matches(vec![(CommandItem::RemotePrompt(0), None, 0)]);
+        let description = rows
+            .first()
+            .and_then(|row| row.description.as_deref())
+            .expect("description should be present");
+        assert_eq!(
+            description,
+            "remote draft prompt | req: TOPIC=... | opt: DETAILS=..."
+        );
     }
 }

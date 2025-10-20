@@ -87,6 +87,78 @@ async fn rmcp_client_can_list_prompts() -> anyhow::Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rmcp_client_lists_prompt_argument_metadata() -> anyhow::Result<()> {
+    let client = RmcpClient::new_stdio_client(
+        stdio_server_bin()?.into(),
+        Vec::<OsString>::new(),
+        None,
+        &[],
+        None,
+    )
+    .await?;
+
+    client
+        .initialize(init_params(), Some(Duration::from_secs(5)))
+        .await?;
+
+    let list = client
+        .list_prompts(None, Some(Duration::from_secs(5)))
+        .await?;
+    let prompt = list
+        .prompts
+        .iter()
+        .find(|prompt| prompt.name == PROMPT_NAME)
+        .expect("prompt missing from list");
+
+    let argument = prompt
+        .arguments
+        .as_ref()
+        .and_then(|args| args.first())
+        .expect("prompt missing argument metadata");
+
+    assert_eq!(argument.name, "name");
+    assert_eq!(argument.description.as_deref(), Some("Name to greet"));
+    assert_eq!(argument.required, Some(true));
+    assert_eq!(argument.title.as_deref(), Some("Recipient"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rmcp_client_reports_unknown_prompt_error() -> anyhow::Result<()> {
+    let client = RmcpClient::new_stdio_client(
+        stdio_server_bin()?.into(),
+        Vec::<OsString>::new(),
+        None,
+        &[],
+        None,
+    )
+    .await?;
+
+    client
+        .initialize(init_params(), Some(Duration::from_secs(5)))
+        .await?;
+
+    let err = client
+        .get_prompt(
+            GetPromptRequestParams {
+                name: "non-existent".to_string(),
+                arguments: None,
+            },
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .expect_err("expected prompts/get to fail for unknown prompt");
+
+    assert!(
+        err.to_string().contains("prompt `non-existent` not found"),
+        "unexpected error: {err:#}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn rmcp_client_can_get_prompt() -> anyhow::Result<()> {
     let client = RmcpClient::new_stdio_client(
         stdio_server_bin()?.into(),

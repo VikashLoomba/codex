@@ -29,8 +29,12 @@ use super::footer::toggle_shortcut_mode;
 use super::paste_burst::CharDecision;
 use super::paste_burst::PasteBurst;
 use crate::bottom_pane::paste_burst::FlushResult;
+use crate::bottom_pane::prompt_args::MCP_PROMPT_CMD_PREFIX;
+use crate::bottom_pane::prompt_args::McpPrompt;
+use crate::bottom_pane::prompt_args::McpPromptInvocation;
 use crate::bottom_pane::prompt_args::expand_custom_prompt;
 use crate::bottom_pane::prompt_args::expand_if_numeric_with_positional_args;
+use crate::bottom_pane::prompt_args::expand_mcp_prompt;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::prompt_args::prompt_argument_names;
 use crate::bottom_pane::prompt_args::prompt_command_with_arg_placeholders;
@@ -38,6 +42,7 @@ use crate::bottom_pane::prompt_args::prompt_has_numeric_placeholders;
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
 use crate::style::user_message_style;
+use codex_core::protocol::Op;
 use codex_protocol::custom_prompts::CustomPrompt;
 use codex_protocol::custom_prompts::PROMPTS_CMD_PREFIX;
 
@@ -106,6 +111,7 @@ pub(crate) struct ChatComposer {
     // When true, disables paste-burst logic and inserts characters immediately.
     disable_paste_burst: bool,
     custom_prompts: Vec<CustomPrompt>,
+    mcp_prompts: Vec<McpPrompt>,
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
     context_window_percent: Option<i64>,
@@ -149,6 +155,7 @@ impl ChatComposer {
             paste_burst: PasteBurst::default(),
             disable_paste_burst: false,
             custom_prompts: Vec::new(),
+            mcp_prompts: Vec::new(),
             footer_mode: FooterMode::ShortcutSummary,
             footer_hint_override: None,
             context_window_percent: None,
@@ -490,6 +497,17 @@ impl ChatComposer {
                                 }
                             }
                         }
+                        CommandItem::RemotePrompt(idx) => {
+                            if let Some(prompt) = popup.remote_prompt(idx) {
+                                let mut text =
+                                    format!("/{MCP_PROMPT_CMD_PREFIX}:{}", prompt.qualified_name);
+                                if !text.ends_with(' ') {
+                                    text.push(' ');
+                                }
+                                self.textarea.set_text(&text);
+                                cursor_target = Some(text.len());
+                            }
+                        }
                     }
                     if let Some(pos) = cursor_target {
                         self.textarea.set_cursor(pos);
@@ -540,6 +558,19 @@ impl ChatComposer {
                                         return (InputResult::None, true);
                                     }
                                 }
+                            }
+                            return (InputResult::None, true);
+                        }
+                        CommandItem::RemotePrompt(idx) => {
+                            if let Some(prompt) = popup.remote_prompt(idx) {
+                                let mut text =
+                                    format!("/{MCP_PROMPT_CMD_PREFIX}:{}", prompt.qualified_name);
+                                if !text.ends_with(' ') {
+                                    text.push(' ');
+                                }
+                                self.textarea.set_text(&text);
+                                self.textarea.set_cursor(text.len());
+                                return (InputResult::None, true);
                             }
                             return (InputResult::None, true);
                         }
@@ -1001,7 +1032,16 @@ impl ChatComposer {
                                     .any(|prompt| prompt.name == prompt_name)
                             })
                             .unwrap_or(false);
-                        if !is_builtin && !is_known_prompt {
+                        let mcp_prompt_prefix = format!("{MCP_PROMPT_CMD_PREFIX}:");
+                        let is_known_mcp_prompt = name
+                            .strip_prefix(&mcp_prompt_prefix)
+                            .map(|prompt_name| {
+                                self.mcp_prompts
+                                    .iter()
+                                    .any(|prompt| prompt.qualified_name == prompt_name)
+                            })
+                            .unwrap_or(false);
+                        if !is_builtin && !is_known_prompt && !is_known_mcp_prompt {
                             let message = format!(
                                 r#"Unrecognized command '/{name}'. Type "/" for a list of supported commands."#
                             );
@@ -1013,6 +1053,52 @@ impl ChatComposer {
                             return (InputResult::None, true);
                         }
                     }
+                }
+
+                match expand_mcp_prompt(&text, &self.mcp_prompts) {
+                    Ok(Some(invocation)) => {
+                        if has_attachments {
+                            self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                                history_cell::new_error_event(
+                                    "MCP prompts do not support image attachments.".to_string(),
+                                ),
+                            )));
+                            self.textarea.set_text(&original_input);
+                            self.textarea.set_cursor(original_input.len());
+                            return (InputResult::None, true);
+                        }
+
+                        let McpPromptInvocation {
+                            qualified_name,
+                            server_name,
+                            prompt_name,
+                            arguments,
+                        } = invocation;
+
+                        self.history.record_local_submission(&text);
+                        let info_message =
+                            format!("Fetching MCP prompt `{qualified_name}` from `{server_name}`");
+                        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_info_event(info_message, None),
+                        )));
+                        self.app_event_tx.send(AppEvent::CodexOp(Op::RunMcpPrompt {
+                            qualified_name,
+                            server_name,
+                            prompt_name,
+                            arguments,
+                        }));
+                        self.active_popup = ActivePopup::None;
+                        return (InputResult::None, true);
+                    }
+                    Err(err) => {
+                        self.app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+                            history_cell::new_error_event(err.user_message()),
+                        )));
+                        self.textarea.set_text(&original_input);
+                        self.textarea.set_cursor(original_input.len());
+                        return (InputResult::None, true);
+                    }
+                    Ok(None) => {}
                 }
 
                 let expanded_prompt = match expand_custom_prompt(&text, &self.custom_prompts) {
@@ -1443,6 +1529,7 @@ impl ChatComposer {
             _ => {
                 if is_editing_slash_command_name {
                     let mut command_popup = CommandPopup::new(self.custom_prompts.clone());
+                    command_popup.set_remote_prompts(self.mcp_prompts.clone());
                     command_popup.on_composer_text_change(first_line.to_string());
                     self.active_popup = ActivePopup::Command(command_popup);
                 }
@@ -1454,6 +1541,14 @@ impl ChatComposer {
         self.custom_prompts = prompts.clone();
         if let ActivePopup::Command(popup) = &mut self.active_popup {
             popup.set_prompts(prompts);
+            popup.set_remote_prompts(self.mcp_prompts.clone());
+        }
+    }
+
+    pub(crate) fn set_mcp_prompts(&mut self, prompts: Vec<McpPrompt>) {
+        self.mcp_prompts = prompts.clone();
+        if let ActivePopup::Command(popup) = &mut self.active_popup {
+            popup.set_remote_prompts(prompts);
         }
     }
 
@@ -2270,6 +2365,9 @@ mod tests {
                 }
                 Some(CommandItem::UserPrompt(_)) => {
                     panic!("unexpected prompt selected for '/mo'")
+                }
+                Some(CommandItem::RemotePrompt(_)) => {
+                    panic!("unexpected MCP prompt selected for '/mo'")
                 }
                 None => panic!("no selected command for '/mo'"),
             },
@@ -3292,6 +3390,65 @@ mod tests {
 
         let expected = "First: one two\nSecond: one two".to_string();
         assert_eq!(InputResult::Submitted(expected), result);
+    }
+
+    #[test]
+    fn remote_prompt_submission_sends_run_op() {
+        use crate::bottom_pane::prompt_args::McpPromptArgument;
+        use codex_core::protocol::Op;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, mut rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_mcp_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: None,
+            argument_hint: None,
+            arguments: vec![McpPromptArgument {
+                name: "TOPIC".to_string(),
+                required: true,
+            }],
+        }]);
+
+        composer
+            .textarea
+            .set_text("/prompt:server__draft TOPIC=release-notes");
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(InputResult::None, result);
+
+        // First event should be the info history cell.
+        match rx.try_recv().expect("info event") {
+            AppEvent::InsertHistoryCell(_) => {}
+            other => panic!("expected info history event, got {other:?}"),
+        }
+
+        match rx.try_recv().expect("run op event") {
+            AppEvent::CodexOp(Op::RunMcpPrompt {
+                qualified_name,
+                server_name,
+                prompt_name,
+                arguments,
+            }) => {
+                assert_eq!(qualified_name, "server__draft");
+                assert_eq!(server_name, "server");
+                assert_eq!(prompt_name, "draft");
+                assert_eq!(arguments.get("TOPIC"), Some(&"release-notes".to_string()));
+            }
+            other => panic!("expected RunMcpPrompt op, got {other:?}"),
+        }
     }
 
     #[test]

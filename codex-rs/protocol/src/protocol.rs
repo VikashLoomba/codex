@@ -171,6 +171,18 @@ pub enum Op {
     /// Request the list of available custom prompts.
     ListCustomPrompts,
 
+    /// Request the list of prompts exposed by connected MCP servers.
+    ListMcpPrompts,
+
+    /// Request execution of an MCP prompt with provided arguments.
+    RunMcpPrompt {
+        qualified_name: String,
+        server_name: String,
+        prompt_name: String,
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        arguments: HashMap<String, String>,
+    },
+
     /// Request the agent to summarize the current conversation context.
     /// The agent will use its existing context (either conversation history or previous response id)
     /// to generate a summary which will be returned as an AgentMessage event.
@@ -505,6 +517,15 @@ pub enum EventMsg {
 
     /// List of custom prompts available to the agent.
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
+
+    /// List of MCP prompts aggregated from configured servers.
+    McpPromptsResponse(McpPromptsResponseEvent),
+
+    /// Response that returns rendered MCP prompt content ready for submission.
+    McpPromptReady(McpPromptReadyEvent),
+
+    /// Error occurred while preparing an MCP prompt.
+    McpPromptError(McpPromptErrorEvent),
 
     PlanUpdate(UpdatePlanArgs),
 
@@ -1294,10 +1315,51 @@ impl fmt::Display for McpAuthStatus {
     }
 }
 
-/// Response payload for `Op::ListCustomPrompts`.
+/// Generic response payload for prompt listings.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
-pub struct ListCustomPromptsResponseEvent {
-    pub custom_prompts: Vec<CustomPrompt>,
+#[schemars(bound = "T: JsonSchema")]
+#[ts(bound = "T: TS")]
+pub struct PromptsListResponseEvent<T> {
+    pub custom_prompts: Vec<T>,
+}
+
+/// Response payload for `Op::ListCustomPrompts`.
+pub type ListCustomPromptsResponseEvent = PromptsListResponseEvent<CustomPrompt>;
+
+#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct McpPromptArgument {
+    pub name: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct McpPromptSummary {
+    pub qualified_name: String,
+    pub server_name: String,
+    pub prompt_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    pub arguments: Vec<McpPromptArgument>,
+}
+
+pub type McpPromptsResponseEvent = PromptsListResponseEvent<McpPromptSummary>;
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct McpPromptReadyEvent {
+    pub server_name: String,
+    pub prompt_name: String,
+    pub qualified_name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+pub struct McpPromptErrorEvent {
+    pub server_name: String,
+    pub prompt_name: String,
+    pub qualified_name: String,
+    pub message: String,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, TS)]

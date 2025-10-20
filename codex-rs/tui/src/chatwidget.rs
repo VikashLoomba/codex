@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::bottom_pane::McpPrompt as UiMcpPrompt;
+use crate::bottom_pane::McpPromptArgument as UiMcpPromptArgument;
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
 use codex_core::git_info::current_branch_name;
@@ -26,6 +28,9 @@ use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::InputMessageKind;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
 use codex_core::protocol::McpListToolsResponseEvent;
+use codex_core::protocol::McpPromptErrorEvent;
+use codex_core::protocol::McpPromptReadyEvent;
+use codex_core::protocol::McpPromptsResponseEvent;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
 use codex_core::protocol::Op;
@@ -346,6 +351,7 @@ impl ChatWidget {
         }
         // Ask codex-core to enumerate custom prompts for this session.
         self.submit_op(Op::ListCustomPrompts);
+        self.submit_op(Op::ListMcpPrompts);
         if let Some(user_message) = self.initial_user_message.take() {
             self.submit_user_message(user_message);
         }
@@ -1490,6 +1496,9 @@ impl ChatWidget {
             EventMsg::GetHistoryEntryResponse(ev) => self.on_get_history_entry_response(ev),
             EventMsg::McpListToolsResponse(ev) => self.on_list_mcp_tools(ev),
             EventMsg::ListCustomPromptsResponse(ev) => self.on_list_custom_prompts(ev),
+            EventMsg::McpPromptsResponse(ev) => self.on_mcp_prompts(ev),
+            EventMsg::McpPromptReady(ev) => self.on_mcp_prompt_ready(ev),
+            EventMsg::McpPromptError(ev) => self.on_mcp_prompt_error(ev),
             EventMsg::ShutdownComplete => self.on_shutdown_complete(),
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => self.on_turn_diff(unified_diff),
             EventMsg::BackgroundEvent(BackgroundEventEvent { message }) => {
@@ -2084,6 +2093,52 @@ impl ChatWidget {
         debug!("received {len} custom prompts");
         // Forward to bottom pane so the slash popup can show them now.
         self.bottom_pane.set_custom_prompts(ev.custom_prompts);
+    }
+
+    fn on_mcp_prompts(&mut self, ev: McpPromptsResponseEvent) {
+        debug!("received {} MCP prompts", ev.custom_prompts.len());
+        let prompts: Vec<UiMcpPrompt> = ev
+            .custom_prompts
+            .into_iter()
+            .map(|prompt| UiMcpPrompt {
+                qualified_name: prompt.qualified_name,
+                server_name: prompt.server_name,
+                prompt_name: prompt.prompt_name,
+                description: prompt.description,
+                argument_hint: prompt.argument_hint,
+                arguments: prompt
+                    .arguments
+                    .into_iter()
+                    .map(|arg| UiMcpPromptArgument {
+                        name: arg.name,
+                        required: arg.required,
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.bottom_pane.set_mcp_prompts(prompts);
+    }
+
+    fn on_mcp_prompt_ready(&mut self, ev: McpPromptReadyEvent) {
+        self.add_info_message(
+            format!(
+                "MCP prompt `{}` from `{}` returned content.",
+                ev.prompt_name, ev.server_name
+            ),
+            None,
+        );
+
+        self.submit_user_message(UserMessage {
+            text: ev.content,
+            image_paths: Vec::new(),
+        });
+    }
+
+    fn on_mcp_prompt_error(&mut self, ev: McpPromptErrorEvent) {
+        self.add_error_message(format!(
+            "Failed to run MCP prompt `{}`: {}",
+            ev.qualified_name, ev.message
+        ));
     }
 
     pub(crate) fn open_review_popup(&mut self) {

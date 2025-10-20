@@ -40,6 +40,19 @@ Custom prompts turn your repeatable instructions into reusable slash commands, s
 3. Type `prompts:` (or start typing the prompt name) and select it with ↑/↓.
 4. Provide any required arguments, press Enter, and Codex sends the expanded content.
 
+### MCP server prompts
+
+If you connect Model Context Protocol (MCP) servers that expose prompts via
+`prompts/list`, Codex automatically loads them when a session starts.
+
+- Remote prompts appear in the slash popup using the `/prompt:<qualified-name>`
+  form. The qualified name combines the server and prompt names (for example,
+  `/prompt:docs__release-notes`).
+- Provide arguments the same way as custom prompts: `KEY=value` pairs after the
+  command. Codex validates required arguments before calling the MCP server.
+- When the MCP server returns the prompt content, Codex injects it into the
+  composer as a normal user message so you can immediately run the turn.
+
 ### Examples
 
 **Draft PR helper**

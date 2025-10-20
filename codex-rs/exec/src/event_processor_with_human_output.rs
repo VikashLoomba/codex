@@ -490,6 +490,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::ListCustomPromptsResponse(_) => {
                 // Currently ignored in exec output.
             }
+            EventMsg::McpPromptsResponse(_) => {}
+            EventMsg::McpPromptReady(_) => {}
+            EventMsg::McpPromptError(_) => {}
             EventMsg::ViewImageToolCall(view) => {
                 ts_msg!(
                     self,
