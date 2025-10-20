@@ -2128,10 +2128,18 @@ impl ChatWidget {
             None,
         );
 
-        self.submit_user_message(UserMessage {
-            text: ev.content,
-            image_paths: Vec::new(),
-        });
+        if self.bottom_pane.is_task_running() {
+            self.queued_user_messages.push_back(UserMessage {
+                text: ev.content,
+                image_paths: Vec::new(),
+            });
+            self.refresh_queued_user_messages();
+        } else {
+            self.submit_user_message(UserMessage {
+                text: ev.content,
+                image_paths: Vec::new(),
+            });
+        }
     }
 
     fn on_mcp_prompt_error(&mut self, ev: McpPromptErrorEvent) {
