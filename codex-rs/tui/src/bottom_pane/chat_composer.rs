@@ -35,6 +35,7 @@ use crate::bottom_pane::prompt_args::McpPromptInvocation;
 use crate::bottom_pane::prompt_args::expand_custom_prompt;
 use crate::bottom_pane::prompt_args::expand_if_numeric_with_positional_args;
 use crate::bottom_pane::prompt_args::expand_mcp_prompt;
+use crate::bottom_pane::prompt_args::mcp_prompt_command_with_arg_placeholders;
 use crate::bottom_pane::prompt_args::parse_slash_name;
 use crate::bottom_pane::prompt_args::prompt_argument_names;
 use crate::bottom_pane::prompt_args::prompt_command_with_arg_placeholders;
@@ -499,13 +500,30 @@ impl ChatComposer {
                         }
                         CommandItem::RemotePrompt(idx) => {
                             if let Some(prompt) = popup.remote_prompt(idx) {
-                                let mut text =
-                                    format!("/{MCP_PROMPT_CMD_PREFIX}:{}", prompt.qualified_name);
-                                if !text.ends_with(' ') {
-                                    text.push(' ');
+                                let required_args: Vec<String> = prompt
+                                    .arguments
+                                    .iter()
+                                    .filter(|arg| arg.required)
+                                    .map(|arg| arg.name.clone())
+                                    .collect();
+                                if required_args.is_empty() {
+                                    let mut text = format!(
+                                        "/{MCP_PROMPT_CMD_PREFIX}:{}",
+                                        prompt.qualified_name
+                                    );
+                                    if !text.ends_with(' ') {
+                                        text.push(' ');
+                                    }
+                                    self.textarea.set_text(&text);
+                                    cursor_target = Some(text.len());
+                                } else {
+                                    let (text, cursor) = mcp_prompt_command_with_arg_placeholders(
+                                        &prompt.qualified_name,
+                                        &required_args,
+                                    );
+                                    self.textarea.set_text(&text);
+                                    cursor_target = Some(cursor);
                                 }
-                                self.textarea.set_text(&text);
-                                cursor_target = Some(text.len());
                             }
                         }
                     }
@@ -563,13 +581,30 @@ impl ChatComposer {
                         }
                         CommandItem::RemotePrompt(idx) => {
                             if let Some(prompt) = popup.remote_prompt(idx) {
-                                let mut text =
-                                    format!("/{MCP_PROMPT_CMD_PREFIX}:{}", prompt.qualified_name);
-                                if !text.ends_with(' ') {
-                                    text.push(' ');
+                                let required_args: Vec<String> = prompt
+                                    .arguments
+                                    .iter()
+                                    .filter(|arg| arg.required)
+                                    .map(|arg| arg.name.clone())
+                                    .collect();
+                                if required_args.is_empty() {
+                                    let mut text = format!(
+                                        "/{MCP_PROMPT_CMD_PREFIX}:{}",
+                                        prompt.qualified_name
+                                    );
+                                    if !text.ends_with(' ') {
+                                        text.push(' ');
+                                    }
+                                    self.textarea.set_text(&text);
+                                    self.textarea.set_cursor(text.len());
+                                } else {
+                                    let (text, cursor) = mcp_prompt_command_with_arg_placeholders(
+                                        &prompt.qualified_name,
+                                        &required_args,
+                                    );
+                                    self.textarea.set_text(&text);
+                                    self.textarea.set_cursor(cursor);
                                 }
-                                self.textarea.set_text(&text);
-                                self.textarea.set_cursor(text.len());
                                 return (InputResult::None, true);
                             }
                             return (InputResult::None, true);
@@ -3449,6 +3484,104 @@ mod tests {
             }
             other => panic!("expected RunMcpPrompt op, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remote_prompt_required_args_prefill_on_tab() {
+        use crate::bottom_pane::prompt_args::McpPromptArgument;
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_mcp_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: None,
+            argument_hint: None,
+            arguments: vec![McpPromptArgument {
+                name: "TOPIC".to_string(),
+                required: true,
+            }],
+        }]);
+
+        composer.textarea.set_text("/prompt:server__draft");
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_command_popup();
+
+        match &composer.active_popup {
+            ActivePopup::Command(popup) => match popup.selected_item() {
+                Some(CommandItem::RemotePrompt(0)) => {}
+                other => panic!("expected remote prompt selected, got {other:?}"),
+            },
+            ActivePopup::File(_) => panic!("expected command popup, got file popup"),
+            ActivePopup::None => panic!("expected command popup, but none active"),
+        }
+
+        let (_result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+
+        assert_eq!(composer.textarea.text(), "/prompt:server__draft TOPIC=\"\"");
+        assert_eq!(
+            composer.textarea.cursor(),
+            composer.textarea.text().len() - 1
+        );
+    }
+
+    #[test]
+    fn remote_prompt_required_args_prefill_on_first_enter() {
+        use crate::bottom_pane::prompt_args::McpPromptArgument;
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyModifiers;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        composer.set_mcp_prompts(vec![McpPrompt {
+            qualified_name: "server__draft".to_string(),
+            server_name: "server".to_string(),
+            prompt_name: "draft".to_string(),
+            description: None,
+            argument_hint: None,
+            arguments: vec![McpPromptArgument {
+                name: "TOPIC".to_string(),
+                required: true,
+            }],
+        }]);
+
+        composer.textarea.set_text("/prompt:server__draft");
+        composer.textarea.set_cursor(composer.textarea.text().len());
+        composer.sync_command_popup();
+
+        let (result, _needs_redraw) =
+            composer.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(result, InputResult::None);
+        assert_eq!(composer.textarea.text(), "/prompt:server__draft TOPIC=\"\"");
+        assert_eq!(
+            composer.textarea.cursor(),
+            composer.textarea.text().len() - 1
+        );
     }
 
     #[test]

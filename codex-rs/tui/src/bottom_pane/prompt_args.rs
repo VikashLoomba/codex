@@ -365,18 +365,32 @@ pub fn expand_numeric_placeholders(content: &str, args: &[String]) -> String {
     out
 }
 
-/// Constructs a command text for a custom prompt with arguments.
-/// Returns the text and the cursor position (inside the first double quote).
-pub fn prompt_command_with_arg_placeholders(name: &str, args: &[String]) -> (String, usize) {
-    let mut text = format!("/{PROMPTS_CMD_PREFIX}:{name}");
-    let mut cursor: usize = text.len();
-    for (i, arg) in args.iter().enumerate() {
-        text.push_str(format!(" {arg}=\"\"").as_str());
-        if i == 0 {
-            cursor = text.len() - 1; // inside first ""
+fn command_with_arg_placeholders(prefix: &str, name: &str, args: &[String]) -> (String, usize) {
+    let mut text = format!("/{prefix}:{name}");
+    let mut cursor = text.len();
+    for (idx, arg) in args.iter().enumerate() {
+        text.push(' ');
+        text.push_str(arg);
+        text.push('=');
+        text.push('"');
+        text.push('"');
+        if idx == 0 {
+            cursor = text.len() - 1;
         }
     }
     (text, cursor)
+}
+
+/// Constructs a command text for a custom prompt with arguments.
+/// Returns the text and the cursor position (inside the first double quote).
+pub fn prompt_command_with_arg_placeholders(name: &str, args: &[String]) -> (String, usize) {
+    command_with_arg_placeholders(PROMPTS_CMD_PREFIX, name, args)
+}
+
+/// Constructs a command text for an MCP prompt with required arguments.
+/// Returns the text and the cursor position (inside the first double quote).
+pub fn mcp_prompt_command_with_arg_placeholders(name: &str, args: &[String]) -> (String, usize) {
+    command_with_arg_placeholders(MCP_PROMPT_CMD_PREFIX, name, args)
 }
 
 #[cfg(test)]
